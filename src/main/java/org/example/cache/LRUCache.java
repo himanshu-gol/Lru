@@ -1,18 +1,19 @@
 package org.example.cache;
 
-import java.util.ArrayDeque;
-import java.util.Deque;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Simple, thread-safe LRU cache.
+ * Simple, thread-safe LRU cache with O(1) get/put/evict.
  *
- * - Uses {@link ConcurrentHashMap} to store key/value pairs.
- * - Uses a {@link Deque} to keep keys in LRU order (front = oldest, back = newest).
- * - All public methods are protected by a single lock for clarity.
+ * - ConcurrentHashMap<K, V> stores the values.
+ * - A doubly linked list stores keys from LRU (head) to MRU (tail).
+ * - A second map K -> Node lets us jump to the list node for a key in O(1).
+ * - All public methods are protected by a single lock.
  */
 public final class LRUCache<K, V> {
 
@@ -21,8 +22,23 @@ public final class LRUCache<K, V> {
 
     private final int capacity;
     private final ConcurrentHashMap<K, V> map;
-    private final Deque<K> order; // front = LRU, back = MRU
+    private final Map<K, Node<K>> keyToNode;
+    private Node<K> head; // least recently used
+    private Node<K> tail; // most recently used
     private final ReentrantLock lock = new ReentrantLock();
+
+    /**
+     * Node for the doubly linked list of keys.
+     */
+    private static final class Node<K> {
+        final K key;
+        Node<K> prev;
+        Node<K> next;
+
+        Node(K key) {
+            this.key = key;
+        }
+    }
 
     /**
      * Creates a cache with the given maximum size.
@@ -33,7 +49,7 @@ public final class LRUCache<K, V> {
         }
         this.capacity = capacity;
         this.map = new ConcurrentHashMap<>(capacity);
-        this.order = new ArrayDeque<>(capacity);
+        this.keyToNode = new HashMap<>(capacity);
     }
 
     /**
@@ -53,9 +69,7 @@ public final class LRUCache<K, V> {
             if (value == null) {
                 return Optional.empty();
             }
-            // Move key to MRU end.
-            order.remove(key);
-            order.addLast(key);
+            moveToTail(key);
             return Optional.of(value);
         } finally {
             lock.unlock();
@@ -76,8 +90,7 @@ public final class LRUCache<K, V> {
             if (map.containsKey(key)) {
                 // Update existing value and move key to MRU.
                 map.put(key, value);
-                order.remove(key);
-                order.addLast(key);
+                moveToTail(key);
                 return;
             }
 
@@ -87,7 +100,7 @@ public final class LRUCache<K, V> {
             }
 
             map.put(key, value);
-            order.addLast(key); // new key is MRU
+            addToTail(key);
         } finally {
             lock.unlock();
         }
@@ -100,7 +113,7 @@ public final class LRUCache<K, V> {
         lock.lock();
         try {
             if (map.remove(key) != null) {
-                order.remove(key);
+                removeNodeForKey(key);
             }
         } finally {
             lock.unlock();
@@ -138,9 +151,17 @@ public final class LRUCache<K, V> {
         }
     }
 
+    /**
+     * Debug helper to print all entries (order is unspecified).
+     */
     public void printAllEntries() {
-        for(K key : map.keySet()) {
-            System.out.println(key + ": " + map.get(key));
+        lock.lock();
+        try {
+            for (K key : map.keySet()) {
+                System.out.println(key + ": " + map.get(key));
+            }
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -149,10 +170,86 @@ public final class LRUCache<K, V> {
      * Assumes the lock is already held by the caller.
      */
     private void evict() {
-        K lruKey = order.pollFirst();
-        if (lruKey != null) {
-            System.out.println("removing the key: " + lruKey);
-            map.remove(lruKey);
+        if (head == null) {
+            return;
+        }
+        K lruKey = head.key;
+        // unlink head
+        if (head.next != null) {
+            head.next.prev = null;
+        }
+        head = head.next;
+        if (head == null) {
+            tail = null;
+        }
+        keyToNode.remove(lruKey);
+        map.remove(lruKey);
+    }
+
+    /**
+     * Moves the node for the given key to the tail (MRU position).
+     */
+    private void moveToTail(K key) {
+        Node<K> node = keyToNode.get(key);
+        if (node == null || node == tail) {
+            return;
+        }
+        // unlink node
+        if (node.prev != null) {
+            node.prev.next = node.next;
+        } else {
+            // node was head
+            head = node.next;
+        }
+        if (node.next != null) {
+            node.next.prev = node.prev;
+        }
+        // link at tail
+        node.prev = tail;
+        node.next = null;
+        if (tail != null) {
+            tail.next = node;
+        }
+        tail = node;
+        if (head == null) {
+            head = node;
+        }
+    }
+
+    /**
+     * Adds a new key at the tail (MRU position).
+     */
+    private void addToTail(K key) {
+        Node<K> node = new Node<>(key);
+        keyToNode.put(key, node);
+        node.prev = tail;
+        node.next = null;
+        if (tail != null) {
+            tail.next = node;
+        }
+        tail = node;
+        if (head == null) {
+            head = node;
+        }
+    }
+
+    /**
+     * Removes the node corresponding to the given key from the list and map.
+     */
+    private void removeNodeForKey(K key) {
+        Node<K> node = keyToNode.remove(key);
+        if (node == null) {
+            return;
+        }
+        if (node.prev != null) {
+            node.prev.next = node.next;
+        } else {
+            head = node.next;
+        }
+        if (node.next != null) {
+            node.next.prev = node.prev;
+        } else {
+            tail = node.prev;
         }
     }
 }
