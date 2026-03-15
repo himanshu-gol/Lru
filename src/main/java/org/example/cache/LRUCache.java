@@ -1,17 +1,18 @@
 package org.example.cache;
 
-import org.example.eviction.DequeEvictionPolicy;
-import org.example.eviction.DoublyLinkedEvictionPolicy;
-import org.example.eviction.EvictionPolicy;
-
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Thread-safe LRU cache backed by ConcurrentHashMap with a pluggable eviction policy
- * (e.g. doubly linked list or deque). All operations are synchronized for consistency.
+ * Simple, thread-safe LRU cache.
+ *
+ * - Uses {@link ConcurrentHashMap} to store key/value pairs.
+ * - Uses a {@link Deque} to keep keys in LRU order (front = oldest, back = newest).
+ * - All public methods are protected by a single lock for clarity.
  */
 public final class LRUCache<K, V> {
 
@@ -20,107 +21,138 @@ public final class LRUCache<K, V> {
 
     private final int capacity;
     private final ConcurrentHashMap<K, V> map;
-    private final EvictionPolicy<K> evictionPolicy;
-    private final ReentrantLock evictionLock = new ReentrantLock();
+    private final Deque<K> order; // front = LRU, back = MRU
+    private final ReentrantLock lock = new ReentrantLock();
 
-    public LRUCache(int capacity, EvictionPolicy<K> evictionPolicy) {
-        if (capacity <= 0) throw new IllegalArgumentException("capacity must be positive");
+    /**
+     * Creates a cache with the given maximum size.
+     */
+    public LRUCache(int capacity) {
+        if (capacity <= 0) {
+            throw new IllegalArgumentException("capacity must be positive");
+        }
         this.capacity = capacity;
-        this.evictionPolicy = Objects.requireNonNull(evictionPolicy, "evictionPolicy");
         this.map = new ConcurrentHashMap<>(capacity);
-    }
-
-    /** Creates an LRU cache with doubly linked list eviction and default max size (100). */
-    public static <K, V> LRUCache<K, V> withDoublyLinkedEviction() {
-        return new LRUCache<>(DEFAULT_MAX_SIZE, new DoublyLinkedEvictionPolicy<>());
-    }
-
-    /** Creates an LRU cache with doubly linked list eviction (O(1) get/put/touch). */
-    public static <K, V> LRUCache<K, V> withDoublyLinkedEviction(int capacity) {
-        return new LRUCache<>(capacity, new DoublyLinkedEvictionPolicy<>());
-    }
-
-    /** Creates an LRU cache with deque eviction and default max size (100). */
-    public static <K, V> LRUCache<K, V> withDequeEviction() {
-        return new LRUCache<>(DEFAULT_MAX_SIZE, new DequeEvictionPolicy<>());
-    }
-
-    /** Creates an LRU cache with deque eviction (O(1) put/evict, O(n) touch). */
-    public static <K, V> LRUCache<K, V> withDequeEviction(int capacity) {
-        return new LRUCache<>(capacity, new DequeEvictionPolicy<>());
+        this.order = new ArrayDeque<>(capacity);
     }
 
     /**
-     * Returns the value for the key if present and moves the key to MRU.
-     * Thread-safe: entire read and order update under lock.
+     * Creates a cache with the default maximum size (100).
+     */
+    public static <K, V> LRUCache<K, V> withDefaultCapacity() {
+        return new LRUCache<>(DEFAULT_MAX_SIZE);
+    }
+
+    /**
+     * Returns the value for the key if present and marks it as most recently used.
      */
     public Optional<V> get(K key) {
-        evictionLock.lock();
+        lock.lock();
         try {
-            if (!map.containsKey(key)) return Optional.empty();
             V value = map.get(key);
-            evictionPolicy.addOrTouch(key);
+            if (value == null) {
+                return Optional.empty();
+            }
+            // Move key to MRU end.
+            order.remove(key);
+            order.addLast(key);
             return Optional.of(value);
         } finally {
-            evictionLock.unlock();
+            lock.unlock();
         }
     }
 
     /**
-     * Puts the key-value pair. Evicts LRU entries until size <= capacity.
-     * Thread-safe: eviction and map update under lock.
+     * Puts the key/value pair in the cache.
+     * If the key already exists, its value is replaced and it becomes MRU.
+     * If adding a new key exceeds capacity, the LRU key is evicted.
      */
     public void put(K key, V value) {
-        Objects.requireNonNull(key, "key");
-        Objects.requireNonNull(value, "value");
-        evictionLock.lock();
+        Objects.requireNonNull(key, "key must not be null");
+        Objects.requireNonNull(value, "value must not be null");
+
+        lock.lock();
         try {
-            evictionPolicy.addOrTouch(key);
-            while (evictionPolicy.size() > capacity) {
-                K evictKey = evictionPolicy.pollLru();
-                if (evictKey != null) map.remove(evictKey);
+            if (map.containsKey(key)) {
+                // Update existing value and move key to MRU.
+                map.put(key, value);
+                order.remove(key);
+                order.addLast(key);
+                return;
             }
+
+            // New key: evict if cache is already full.
+            if (map.size() >= capacity) {
+                evict();
+            }
+
             map.put(key, value);
+            order.addLast(key); // new key is MRU
         } finally {
-            evictionLock.unlock();
+            lock.unlock();
         }
     }
 
     /**
-     * Removes the key from cache and from the eviction order.
-     * Thread-safe: both updates under lock.
+     * Removes the key (if present) from the cache.
      */
     public void remove(K key) {
-        evictionLock.lock();
+        lock.lock();
         try {
-            evictionPolicy.remove(key);
-            map.remove(key);
+            if (map.remove(key) != null) {
+                order.remove(key);
+            }
         } finally {
-            evictionLock.unlock();
+            lock.unlock();
         }
     }
 
-    /** Thread-safe: returns current number of entries. */
+    /**
+     * Current number of entries in the cache.
+     */
     public int size() {
-        evictionLock.lock();
+        lock.lock();
         try {
             return map.size();
         } finally {
-            evictionLock.unlock();
+            lock.unlock();
         }
     }
 
+    /**
+     * Maximum number of entries this cache can hold.
+     */
     public int capacity() {
         return capacity;
     }
 
-    /** Thread-safe: returns true if the key is present. */
+    /**
+     * True if the key is present in the cache.
+     */
     public boolean containsKey(K key) {
-        evictionLock.lock();
+        lock.lock();
         try {
             return map.containsKey(key);
         } finally {
-            evictionLock.unlock();
+            lock.unlock();
+        }
+    }
+
+    public void printAllEntries() {
+        for(K key : map.keySet()) {
+            System.out.println(key + ": " + map.get(key));
+        }
+    }
+
+    /**
+     * Removes the least recently used entry from the cache.
+     * Assumes the lock is already held by the caller.
+     */
+    private void evict() {
+        K lruKey = order.pollFirst();
+        if (lruKey != null) {
+            System.out.println("removing the key: " + lruKey);
+            map.remove(lruKey);
         }
     }
 }
