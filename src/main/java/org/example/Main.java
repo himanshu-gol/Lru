@@ -20,6 +20,7 @@ public class Main {
         System.out.println("[T2] get(a) = " + cache.get("a"));           // expect Optional[1]
         System.out.println("[T2] get(b) = " + cache.get("b"));           // expect Optional[2]
         System.out.println("[T2] get(x) = " + cache.get("x"));           // expect Optional.empty
+        System.out.println("[T2] get(x) = " + cache.get("x")); 
 
         // Test 3: LRU eviction when capacity is exceeded
         // What we test: when we insert 4th element into capacity-3 cache, the least recently used is evicted.
